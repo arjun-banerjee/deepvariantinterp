@@ -50,18 +50,54 @@ CHECKPOINT=""
 # ── Parse flags ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bin_version)       BIN_VERSION="$2";      shift 2 ;;
-    --model_type)        MODEL_TYPE="$2";       shift 2 ;;
-    --ref)               REF="$2";              shift 2 ;;
-    --reads)             READS="$2";            shift 2 ;;
-    --output_dir)        OUTPUT_DIR="$2";       shift 2 ;;
-    --checkpoint)        CHECKPOINT="$2";       shift 2 ;;
-    --regions)           REGIONS="$2";          shift 2 ;;
-    --num_shards)        NUM_SHARDS="$2";       shift 2 ;;
-    --hook_layers)       HOOK_LAYERS="$2";      shift 2 ;;
-    --batch_size)        BATCH_SIZE="$2";       shift 2 ;;
-    --max_cache_entries) MAX_CACHE_ENTRIES="$2"; shift 2 ;;
-    *) echo "Unknown flag: $1"; exit 1 ;;
+  --bin_version)
+    BIN_VERSION="$2"
+    shift 2
+    ;;
+  --model_type)
+    MODEL_TYPE="$2"
+    shift 2
+    ;;
+  --ref)
+    REF="$2"
+    shift 2
+    ;;
+  --reads)
+    READS="$2"
+    shift 2
+    ;;
+  --output_dir)
+    OUTPUT_DIR="$2"
+    shift 2
+    ;;
+  --checkpoint)
+    CHECKPOINT="$2"
+    shift 2
+    ;;
+  --regions)
+    REGIONS="$2"
+    shift 2
+    ;;
+  --num_shards)
+    NUM_SHARDS="$2"
+    shift 2
+    ;;
+  --hook_layers)
+    HOOK_LAYERS="$2"
+    shift 2
+    ;;
+  --batch_size)
+    BATCH_SIZE="$2"
+    shift 2
+    ;;
+  --max_cache_entries)
+    MAX_CACHE_ENTRIES="$2"
+    shift 2
+    ;;
+  *)
+    echo "Unknown flag: $1"
+    exit 1
+    ;;
   esac
 done
 
@@ -103,8 +139,8 @@ echo ""
 echo "=== Step 1/3: make_examples (singularity) ==="
 
 MAKE_EXAMPLES_CMD=(
-  singularity run -B /usr/lib/locale/:/usr/lib/locale/
-  "docker://google/deepvariant:${BIN_VERSION}"
+  docker run --rm -v /Users:/Users -v /usr/lib/locale/:/usr/lib/locale/
+  "google/deepvariant:${BIN_VERSION}"
   /opt/deepvariant/bin/make_examples
   --mode calling
   --ref "${REF}"
@@ -128,7 +164,7 @@ echo "=== Step 2/3: call_variants (hooked — native) ==="
 EXAMPLES_PATTERN="${INTERMEDIATE_DIR}/make_examples.tfrecord@${NUM_SHARDS}.gz"
 
 PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" \
-python3 "${REPO_ROOT}/scripts/call_variants_hooked.py" \
+  python3 "${REPO_ROOT}/scripts/call_variants_hooked.py" \
   --examples "${EXAMPLES_PATTERN}" \
   --checkpoint "${CHECKPOINT}" \
   --outfile "${CVO_OUTPUT}" \
@@ -144,8 +180,8 @@ echo "Activations cached to: ${ACTIVATION_CACHE_DIR}"
 echo ""
 echo "=== Step 3/3: postprocess_variants (singularity) ==="
 
-singularity run -B /usr/lib/locale/:/usr/lib/locale/ \
-  "docker://google/deepvariant:${BIN_VERSION}" \
+docker run --rm -v /Users:/Users -v /usr/lib/locale/:/usr/lib/locale/ \
+  "google/deepvariant:${BIN_VERSION}" \
   /opt/deepvariant/bin/postprocess_variants \
   --ref "${REF}" \
   --infile "${CVO_OUTPUT}" \
