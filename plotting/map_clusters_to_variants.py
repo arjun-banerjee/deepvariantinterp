@@ -179,8 +179,19 @@ def parse_call_variants_output(tfrecord_path: str, n_expected: int) -> pd.DataFr
     print(f'Parsed {len(df)} CallVariantsOutput records')
 
     if len(df) != n_expected:
-        print(f'WARNING: Expected {n_expected} records but got {len(df)}',
+        print(f'\nERROR: Mismatch between cluster labels and variant records!',
               file=sys.stderr)
+        print(f'  Expected {n_expected} records (from clustering)',
+              file=sys.stderr)
+        print(f'  Got {len(df)} records (from CallVariantsOutput)',
+              file=sys.stderr)
+        print(f'\nThis indicates the clustering results and variant calls are not aligned.',
+              file=sys.stderr)
+        print(f'Please ensure you are using matching input files.', file=sys.stderr)
+        raise ValueError(
+            f'Record count mismatch: expected {n_expected}, got {len(df)}. '
+            'Clustering results and variant calls must have the same number of samples.'
+        )
 
     return df
 

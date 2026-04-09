@@ -121,8 +121,56 @@ def _parse_args() -> argparse.Namespace:
         default=0.3,
         help='Alpha (opacity) for noise points.',
     )
+    p.add_argument(
+        '--population_metadata',
+        default=None,
+        help='Path to CSV/TSV file with sample population info (columns: sample_id, population, super_population)',
+    )
+    p.add_argument(
+        '--color_by_population',
+        action='store_true',
+        help='Color points by population instead of cluster (requires --population_metadata)',
+    )
 
     return p.parse_args()
+
+
+def load_population_metadata(metadata_path: str) -> dict:
+    """Load population metadata from CSV/TSV file.
+
+    Expected columns: sample_id, population, super_population
+
+    Returns:
+        Dictionary mapping file indices to population info
+    """
+    import pandas as pd
+
+    # Try to detect delimiter
+    with open(metadata_path, 'r') as f:
+        first_line = f.readline()
+        delimiter = '\t' if '\t' in first_line else ','
+
+    df = pd.read_csv(metadata_path, sep=delimiter)
+
+    # Validate required columns
+    required_cols = ['sample_id', 'super_population']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f'Population metadata missing required columns: {missing_cols}. '
+            f'Found columns: {list(df.columns)}'
+        )
+
+    print(f'\nLoaded population metadata from: {metadata_path}')
+    print(f'  Total samples: {len(df)}')
+    print(f'  Super-populations: {df["super_population"].unique()}')
+
+    # Count samples per super-population
+    pop_counts = df['super_population'].value_counts()
+    for pop, count in pop_counts.items():
+        print(f'    {pop}: {count} samples')
+
+    return df
 
 
 def load_activation_matrix(
@@ -388,7 +436,9 @@ def create_cluster_visualization(
     noise_color: str = '#d3d3d3',
     noise_alpha: float = 0.3,
     dpi: int = 150,
-    verbose: bool = True
+    verbose: bool = True,
+    population_labels: np.ndarray | None = None,
+    color_by_population: bool = False
 ) -> None:
     """Create scatter plot visualization with noise in background."""
     try:
@@ -409,7 +459,16 @@ def create_cluster_visualization(
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = np.sum(noise_mask)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(12, 9))
+
+    # Define super-population colors
+    pop_colors = {
+        'AFR': '#FF6B6B',  # African - Red
+        'AMR': '#4ECDC4',  # American - Teal
+        'EAS': '#FFE66D',  # East Asian - Yellow
+        'EUR': '#95E1D3',  # European - Light green
+        'SAS': '#AA96DA',  # South Asian - Purple
+    }
 
     # Plot noise points FIRST (so they're in background)
     if n_noise > 0:
@@ -422,24 +481,60 @@ def create_cluster_visualization(
             s=20,
             label=f'Noise (n={n_noise})',
             edgecolors='none',
-            rasterized=True  # Faster rendering for many points
+            rasterized=True
         )
 
-    # Plot clustered points on top with distinct colors
-    if n_clusters > 0:
-        # Use a categorical colormap
+    # Plot clustered points on top
+    if color_by_population and population_labels is not None:
+        if verbose:
+            print('Coloring points by super-population')
+
+        core_points = X_2d[~noise_mask]
+        core_pops = population_labels[~noise_mask]
+        core_clusters = labels[~noise_mask]
+
+        unique_pops = sorted(set(core_pops))
+        for pop in unique_pops:
+            pop_mask = core_pops == pop
+            points = core_points[pop_mask]
+            color = pop_colors.get(pop, '#999999')
+
+            ax.scatter(
+                points[:, 0],
+                points[:, 1],
+                c=color,
+                alpha=0.7,
+                s=30,
+                label=f'{pop} (n={len(points)})',
+                edgecolors='white',
+                linewidths=0.5,
+                rasterized=True
+            )
+
+        if verbose:
+            print('\nCluster composition by super-population:')
+            for cluster_id in sorted(set(core_clusters)):
+                cluster_mask = core_clusters == cluster_id
+                cluster_pops = core_pops[cluster_mask]
+                pop_counts = {}
+                for pop in cluster_pops:
+                    pop_counts[pop] = pop_counts.get(pop, 0) + 1
+                print(f'  Cluster {cluster_id}:')
+                for pop, count in sorted(pop_counts.items()):
+                    pct = 100.0 * count / len(cluster_pops)
+                    print(f'    {pop}: {count} ({pct:.1f}%)')
+
+    elif n_clusters > 0:
         if n_clusters <= 10:
             cmap = plt.cm.tab10
         elif n_clusters <= 20:
             cmap = plt.cm.tab20
         else:
-            # For many clusters, use a continuous map
             cmap = plt.cm.nipy_spectral
 
         cluster_labels = labels[~noise_mask]
         cluster_points = X_2d[~noise_mask]
 
-        # Plot each cluster separately for better legend control
         unique_labels = sorted(set(cluster_labels))
         for i, label in enumerate(unique_labels):
             mask = cluster_labels == label
@@ -459,25 +554,25 @@ def create_cluster_visualization(
 
     # Formatting
     if title is None:
-        title = f'HDBSCAN Clustering: {n_clusters} clusters, {n_noise} noise points'
+        if color_by_population and population_labels is not None:
+            title = f'Population Distribution: {len(set(population_labels[~noise_mask]))} populations, {n_clusters} clusters'
+        else:
+            title = f'HDBSCAN Clustering: {n_clusters} clusters, {n_noise} noise points'
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_xlabel('UMAP-1', fontsize=12)
     ax.set_ylabel('UMAP-2', fontsize=12)
 
-    # Legend
-    if n_clusters <= 10:  # Only show legend for reasonable number of clusters
-        ax.legend(
-            loc='center left',
-            bbox_to_anchor=(1, 0.5),
-            frameon=True,
-            fancybox=True,
-            shadow=True
-        )
+    ax.legend(
+        loc='center left',
+        bbox_to_anchor=(1, 0.5),
+        frameon=True,
+        fancybox=True,
+        shadow=True
+    )
 
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     fig.tight_layout()
 
-    # Save
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close(fig)
@@ -496,22 +591,26 @@ def save_results(
     file_paths: list,
     file_indices: np.ndarray,
     args: argparse.Namespace,
-    verbose: bool = True
+    verbose: bool = True,
+    population_labels: np.ndarray | None = None
 ) -> None:
     """Save analysis results to .npz and optional JSON files."""
     import json
 
     # Save embeddings and labels
     npz_path = os.path.splitext(output_path)[0] + '_results.npz'
-    np.savez_compressed(
-        npz_path,
-        embedding_2d=embedding_2d,
-        embedding_intermediate=embedding_intermediate,
-        cluster_labels=labels,
-        layer=np.array(layer_name),
-        source_files=np.array(file_paths),
-        file_index_per_row=file_indices,
-    )
+    save_data = {
+        'embedding_2d': embedding_2d,
+        'embedding_intermediate': embedding_intermediate,
+        'cluster_labels': labels,
+        'layer': np.array(layer_name),
+        'source_files': np.array(file_paths),
+        'file_index_per_row': file_indices,
+    }
+    if population_labels is not None:
+        save_data['population_labels'] = population_labels
+
+    np.savez_compressed(npz_path, **save_data)
     if verbose:
         print(f'\nSaved embeddings and labels to: {npz_path}')
 
@@ -557,6 +656,12 @@ def main() -> None:
     print('Experiment 3: Embedding Clustering Pipeline')
     print('='*60)
 
+    # Load population metadata if provided
+    population_df = None
+    population_labels = None
+    if args.population_metadata:
+        population_df = load_population_metadata(args.population_metadata)
+
     # Load data
     print(f'\nLoading activations from: {args.cache_dir}')
     X, layer_name, file_indices, file_paths = load_activation_matrix(
@@ -564,12 +669,38 @@ def main() -> None:
     )
     print(f'Loaded {X.shape[0]} samples, feature dim {X.shape[1]}, layer={layer_name!r}')
 
+    # Map file paths to sample IDs and then to populations
+    if population_df is not None:
+        import pandas as pd
+        population_labels = np.array(['UNKNOWN'] * len(file_indices))
+
+        # Extract sample IDs from file paths
+        for idx, (file_idx, path) in enumerate(zip(file_indices, [file_paths[fi] for fi in file_indices])):
+            # Extract sample ID from filename
+            basename = os.path.basename(path)
+            # Assume format like activations_SAMPLEID.npz or similar
+            # You may need to adjust this parsing logic based on your file naming
+            sample_id = basename.replace('activations_', '').replace('.npz', '').split('_')[0]
+
+            # Look up population for this sample
+            sample_pop = population_df[population_df['sample_id'] == sample_id]
+            if not sample_pop.empty:
+                population_labels[idx] = sample_pop.iloc[0]['super_population']
+
+        print(f'\nMatched {np.sum(population_labels != "UNKNOWN")} samples to population metadata')
+        unique_pops, pop_counts = np.unique(population_labels, return_counts=True)
+        print('Population distribution in activations:')
+        for pop, count in zip(unique_pops, pop_counts):
+            print(f'  {pop}: {count} samples')
+
     # Optional subsampling
     if args.max_samples is not None and args.max_samples < X.shape[0]:
         rng = np.random.default_rng(args.random_state)
         idx = rng.choice(X.shape[0], size=args.max_samples, replace=False)
         X = X[idx]
         file_indices = file_indices[idx]
+        if population_labels is not None:
+            population_labels = population_labels[idx]
         print(f'Subsampled to {X.shape[0]} samples.')
 
     if X.shape[0] < args.min_cluster_size:
@@ -618,7 +749,9 @@ def main() -> None:
         noise_color=args.noise_color,
         noise_alpha=args.noise_alpha,
         dpi=args.dpi,
-        verbose=True
+        verbose=True,
+        population_labels=population_labels,
+        color_by_population=args.color_by_population
     )
 
     # Save results
@@ -632,7 +765,8 @@ def main() -> None:
         file_paths=file_paths,
         file_indices=file_indices,
         args=args,
-        verbose=True
+        verbose=True,
+        population_labels=population_labels
     )
 
     # Final summary
