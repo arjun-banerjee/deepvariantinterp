@@ -1,0 +1,23 @@
+{
+  "clustering_metrics": {
+    "silhouette_score": 0.8757528066635132,
+    "davies_bouldin_index": 0.2244891351779677,
+    "dbcv_score": null
+  },
+  "summary": {
+    "n_samples": 4290,
+    "n_clusters": 16,
+    "n_noise": 0,
+    "noise_percentage": 0.0
+  },
+  "parameters": {
+    "layer": "mixed5",
+    "umap_intermediate_dim": 20,
+    "umap_n_neighbors": 15,
+    "umap_min_dist": 0.1,
+    "min_cluster_size": 50,
+    "min_samples": 50,
+    "cluster_selection_method": "eom",
+    "random_state": 42
+  }
+}
