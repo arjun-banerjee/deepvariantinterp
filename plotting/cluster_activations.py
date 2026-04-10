@@ -40,6 +40,19 @@ def _parse_args() -> argparse.Namespace:
         help='Optional output path for metrics JSON file.',
     )
 
+    # PCA parameters
+    p.add_argument(
+        '--use_pca',
+        action='store_true',
+        help='Apply PCA before UMAP for dimensionality reduction.',
+    )
+    p.add_argument(
+        '--pca_components',
+        type=int,
+        default=50,
+        help='Number of PCA components (default: 50). Only used if --use_pca is set.',
+    )
+
     # UMAP parameters
     p.add_argument(
         '--umap_intermediate_dim',
@@ -218,15 +231,57 @@ def load_activation_matrix(
     return X, resolved_layer, file_idx_per_row, paths
 
 
+def perform_pca_reduction(
+    X: np.ndarray,
+    n_components: int,
+    random_state: int,
+    verbose: bool = True
+) -> np.ndarray:
+    """Perform PCA dimensionality reduction."""
+    try:
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        print('ERROR: scikit-learn not installed. Run: pip install scikit-learn',
+              file=sys.stderr)
+        raise SystemExit(1)
+
+    if verbose:
+        print(f'\n{"="*60}')
+        print('STEP 1: PCA Dimensionality Reduction')
+        print(f'{"="*60}')
+        print(f'Input shape: {X.shape}')
+        print(f'Standardizing features...')
+
+    # Standardize features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    if verbose:
+        print(f'Reducing to {n_components} principal components...')
+
+    # Apply PCA
+    pca = PCA(n_components=n_components, random_state=random_state)
+    X_pca = pca.fit_transform(X_scaled)
+
+    if verbose:
+        variance_explained = pca.explained_variance_ratio_.sum()
+        print(f'PCA output shape: {X_pca.shape}')
+        print(f'Cumulative variance explained: {variance_explained:.2%}')
+
+    return X_pca
+
+
 def perform_umap_reduction(
     X: np.ndarray,
     intermediate_dim: int,
     n_neighbors: int,
     min_dist: float,
     random_state: int,
-    verbose: bool = True
+    verbose: bool = True,
+    step_number: int = 1
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Perform UMAP dimensionality reduction to create both an intermediate-dimensional 
+    """Perform UMAP dimensionality reduction to create both an intermediate-dimensional
     embedding for clustering and a 2D embedding for visualization."""
     try:
         import umap
@@ -240,7 +295,7 @@ def perform_umap_reduction(
 
     if verbose:
         print(f'\n{"="*60}')
-        print('STEP 1: UMAP Dimensionality Reduction')
+        print(f'STEP {step_number}: UMAP Dimensionality Reduction')
         print(f'{"="*60}')
         print(f'Input shape: {X.shape}')
         print(f'Reducing to {intermediate_dim}D for clustering...')
@@ -720,17 +775,32 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    # Step 1: UMAP reduction
+    # Optional PCA preprocessing
+    if args.use_pca:
+        X_preprocessed = perform_pca_reduction(
+            X,
+            n_components=args.pca_components,
+            random_state=args.random_state,
+            verbose=True
+        )
+        step_num = 2
+    else:
+        X_preprocessed = X
+        step_num = 1
+
+    # UMAP reduction
     X_intermediate, X_2d = perform_umap_reduction(
-        X,
+        X_preprocessed,
         intermediate_dim=args.umap_intermediate_dim,
         n_neighbors=args.umap_n_neighbors,
         min_dist=args.umap_min_dist,
         random_state=args.random_state,
-        verbose=True
+        verbose=True,
+        step_number=step_num
     )
 
-    # Step 2: HDBSCAN clustering
+    # HDBSCAN clustering
+    step_num += 1
     labels, clusterer = perform_hdbscan_clustering(
         X_intermediate,
         min_cluster_size=args.min_cluster_size,
