@@ -669,23 +669,32 @@ def main() -> None:
     )
     print(f'Loaded {X.shape[0]} samples, feature dim {X.shape[1]}, layer={layer_name!r}')
 
-    # Map file paths to sample IDs and then to populations
+    # Map file indices to populations
     if population_df is not None:
         import pandas as pd
         population_labels = np.array(['UNKNOWN'] * len(file_indices))
 
-        # Extract sample IDs from file paths
-        for idx, (file_idx, path) in enumerate(zip(file_indices, [file_paths[fi] for fi in file_indices])):
-            # Extract sample ID from filename
-            basename = os.path.basename(path)
-            # Assume format like activations_SAMPLEID.npz or similar
-            # You may need to adjust this parsing logic based on your file naming
-            sample_id = basename.replace('activations_', '').replace('.npz', '').split('_')[0]
+        # Check if metadata has 'file_index' column (for numbered activation files)
+        # or 'sample_id' column (for named activation files)
+        if 'file_index' in population_df.columns:
+            # Use file index directly
+            for idx, file_idx in enumerate(file_indices):
+                sample_pop = population_df[population_df['file_index'] == file_idx]
+                if not sample_pop.empty:
+                    population_labels[idx] = sample_pop.iloc[0]['super_population']
+        else:
+            # Extract sample IDs from file paths
+            for idx, (file_idx, path) in enumerate(zip(file_indices, [file_paths[fi] for fi in file_indices])):
+                # Extract sample ID from filename
+                basename = os.path.basename(path)
+                # Assume format like activations_SAMPLEID.npz or similar
+                # You may need to adjust this parsing logic based on your file naming
+                sample_id = basename.replace('activations_', '').replace('.npz', '').split('_')[0]
 
-            # Look up population for this sample
-            sample_pop = population_df[population_df['sample_id'] == sample_id]
-            if not sample_pop.empty:
-                population_labels[idx] = sample_pop.iloc[0]['super_population']
+                # Look up population for this sample
+                sample_pop = population_df[population_df['sample_id'] == sample_id]
+                if not sample_pop.empty:
+                    population_labels[idx] = sample_pop.iloc[0]['super_population']
 
         print(f'\nMatched {np.sum(population_labels != "UNKNOWN")} samples to population metadata')
         unique_pops, pop_counts = np.unique(population_labels, return_counts=True)
