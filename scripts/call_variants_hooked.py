@@ -16,7 +16,13 @@ Usage:
 
 import json
 import os
+import sys
 import time
+
+# Add repo root to path so 'deepvariant' module can be imported
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+  sys.path.insert(0, REPO_ROOT)
 
 from absl import app
 from absl import flags
