@@ -63,8 +63,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         '--umap_n_neighbors',
         type=int,
-        default=15,
-        help='UMAP n_neighbors parameter.',
+        default=100,
+        help='UMAP n_neighbors parameter (default: 100 for global structure).',
     )
     p.add_argument(
         '--umap_min_dist',
@@ -72,31 +72,18 @@ def _parse_args() -> argparse.Namespace:
         default=0.1,
         help='UMAP min_dist parameter.',
     )
+    p.add_argument(
+        '--umap_3d',
+        action='store_true',
+        help='Generate 3D UMAP visualization in addition to 2D.',
+    )
 
-    # HDBSCAN parameters
+    # K-means clustering
     p.add_argument(
-        '--min_cluster_size',
+        '--n_clusters',
         type=int,
-        default=10,
-        help='HDBSCAN min_cluster_size parameter.',
-    )
-    p.add_argument(
-        '--min_samples',
-        type=int,
-        default=None,
-        help='HDBSCAN min_samples parameter (defaults to min_cluster_size).',
-    )
-    p.add_argument(
-        '--cluster_selection_epsilon',
-        type=float,
-        default=0.0,
-        help='HDBSCAN cluster_selection_epsilon parameter.',
-    )
-    p.add_argument(
-        '--cluster_selection_method',
-        default='eom',
-        choices=['eom', 'leaf'],
-        help='HDBSCAN cluster selection method.',
+        default=5,
+        help='Number of clusters for K-means (default: 5 for super-populations).',
     )
 
     # General parameters
@@ -279,10 +266,11 @@ def perform_umap_reduction(
     min_dist: float,
     random_state: int,
     verbose: bool = True,
-    step_number: int = 1
-) -> Tuple[np.ndarray, np.ndarray]:
+    step_number: int = 1,
+    use_3d: bool = False
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Perform UMAP dimensionality reduction to create both an intermediate-dimensional
-    embedding for clustering and a 2D embedding for visualization."""
+    embedding for clustering and 2D/3D embeddings for visualization."""
     try:
         import umap
     except ImportError:
@@ -298,6 +286,7 @@ def perform_umap_reduction(
         print(f'STEP {step_number}: UMAP Dimensionality Reduction')
         print(f'{"="*60}')
         print(f'Input shape: {X.shape}')
+        print(f'n_neighbors: {n_neighbors_capped} (for global structure)')
         print(f'Reducing to {intermediate_dim}D for clustering...')
 
     # Intermediate UMAP for clustering
@@ -329,58 +318,64 @@ def perform_umap_reduction(
     if verbose:
         print(f'2D embedding shape: {X_2d.shape}')
 
-    return X_intermediate, X_2d
+    # Optional 3D UMAP for visualization
+    X_3d = None
+    if use_3d:
+        if verbose:
+            print(f'\nReducing to 3D for visualization...')
+
+        reducer_3d = umap.UMAP(
+            n_components=3,
+            n_neighbors=n_neighbors_capped,
+            min_dist=min_dist,
+            random_state=random_state,
+            verbose=verbose,
+            metric='euclidean'
+        )
+        X_3d = reducer_3d.fit_transform(X)
+
+        if verbose:
+            print(f'3D embedding shape: {X_3d.shape}')
+
+    return X_intermediate, X_2d, X_3d
 
 
-def perform_hdbscan_clustering(
+def perform_kmeans_clustering(
     X: np.ndarray,
-    min_cluster_size: int,
-    min_samples: int | None,
-    cluster_selection_epsilon: float,
-    cluster_selection_method: str,
+    n_clusters: int,
+    random_state: int,
     verbose: bool = True
 ) -> Tuple[np.ndarray, object]:
-    """Perform HDBSCAN clustering on reduced feature space."""
+    """Perform K-means clustering on reduced feature space."""
     try:
-        import hdbscan
+        from sklearn.cluster import KMeans
     except ImportError:
-        print('ERROR: hdbscan not installed. Run: pip install hdbscan',
+        print('ERROR: scikit-learn not installed. Run: pip install scikit-learn',
               file=sys.stderr)
         raise SystemExit(1)
 
-    if min_samples is None:
-        min_samples = min_cluster_size
-
     if verbose:
         print(f'\n{"="*60}')
-        print('STEP 2: HDBSCAN Clustering')
+        print('STEP 2: K-means Clustering')
         print(f'{"="*60}')
         print(f'Input shape: {X.shape}')
         print(f'Parameters:')
-        print(f'  min_cluster_size: {min_cluster_size}')
-        print(f'  min_samples: {min_samples}')
-        print(f'  cluster_selection_epsilon: {cluster_selection_epsilon}')
-        print(f'  cluster_selection_method: {cluster_selection_method}')
+        print(f'  n_clusters: {n_clusters}')
 
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_epsilon=cluster_selection_epsilon,
-        cluster_selection_method=cluster_selection_method,
-        metric='euclidean',
-        algorithm='best',
-        core_dist_n_jobs=-1  # Use all cores
+    clusterer = KMeans(
+        n_clusters=n_clusters,
+        random_state=random_state,
+        n_init=10,
+        max_iter=300
     )
 
     labels = clusterer.fit_predict(X)
 
     if verbose:
-        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-        n_noise = np.sum(labels == -1)
         print(f'\nClustering complete:')
         print(f'  Number of clusters: {n_clusters}')
-        print(f'  Number of noise points: {n_noise}')
-        print(f'  Cluster sizes: {np.bincount(labels[labels >= 0])}')
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        print(f'  Cluster sizes: {counts}')
 
     return labels, clusterer
 
@@ -480,6 +475,159 @@ def calculate_clustering_metrics(
         metrics['dbcv_score'] = None
 
     return metrics
+
+
+def create_3d_visualization(
+    X_3d: np.ndarray,
+    labels: np.ndarray,
+    noise_mask: np.ndarray,
+    output_path: str,
+    title: str | None = None,
+    noise_color: str = '#d3d3d3',
+    noise_alpha: float = 0.3,
+    dpi: int = 150,
+    verbose: bool = True,
+    population_labels: np.ndarray | None = None,
+    color_by_population: bool = False
+) -> None:
+    """Create interactive 3D scatter plot visualization using Plotly."""
+    try:
+        import plotly.graph_objects as go
+        import plotly.express as px
+    except ImportError:
+        print('ERROR: plotly not installed. Run: pip install plotly',
+              file=sys.stderr)
+        raise SystemExit(1)
+
+    if verbose:
+        print(f'\nCreating interactive 3D visualization...')
+
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise = np.sum(noise_mask)
+
+    # Define super-population colors
+    pop_colors = {
+        'AFR': '#FF6B6B',  # African - Red
+        'AMR': '#4ECDC4',  # American - Teal
+        'EAS': '#FFE66D',  # East Asian - Yellow
+        'EUR': '#95E1D3',  # European - Light green
+        'SAS': '#AA96DA',  # South Asian - Purple
+    }
+
+    fig = go.Figure()
+
+    # Plot noise points FIRST (so they're in background)
+    if n_noise > 0:
+        noise_points = X_3d[noise_mask]
+        fig.add_trace(go.Scatter3d(
+            x=noise_points[:, 0],
+            y=noise_points[:, 1],
+            z=noise_points[:, 2],
+            mode='markers',
+            name=f'Noise (n={n_noise})',
+            marker=dict(
+                size=3,
+                color=noise_color,
+                opacity=noise_alpha,
+            ),
+            hovertemplate='<b>Noise</b><br>UMAP-1: %{x:.2f}<br>UMAP-2: %{y:.2f}<br>UMAP-3: %{z:.2f}<extra></extra>'
+        ))
+
+    # Plot clustered points on top
+    if color_by_population and population_labels is not None:
+        core_points = X_3d[~noise_mask]
+        core_pops = population_labels[~noise_mask]
+        core_clusters = labels[~noise_mask]
+
+        unique_pops = sorted(set(core_pops))
+        for pop in unique_pops:
+            pop_mask = core_pops == pop
+            points = core_points[pop_mask]
+            pop_clusters = core_clusters[pop_mask]
+            color = pop_colors.get(pop, '#999999')
+
+            fig.add_trace(go.Scatter3d(
+                x=points[:, 0],
+                y=points[:, 1],
+                z=points[:, 2],
+                mode='markers',
+                name=f'{pop} (n={len(points)})',
+                marker=dict(
+                    size=4,
+                    color=color,
+                    opacity=0.7,
+                    line=dict(color='white', width=0.5)
+                ),
+                hovertemplate=f'<b>{pop}</b><br>Cluster: %{{customdata}}<br>UMAP-1: %{{x:.2f}}<br>UMAP-2: %{{y:.2f}}<br>UMAP-3: %{{z:.2f}}<extra></extra>',
+                customdata=pop_clusters
+            ))
+
+    elif n_clusters > 0:
+        # Use Plotly color scales for clusters
+        if n_clusters <= 10:
+            colors = px.colors.qualitative.Plotly
+        elif n_clusters <= 24:
+            colors = px.colors.qualitative.Dark24
+        else:
+            colors = px.colors.sample_colorscale('viridis', [i/(n_clusters-1) for i in range(n_clusters)])
+
+        cluster_labels_core = labels[~noise_mask]
+        cluster_points = X_3d[~noise_mask]
+
+        unique_labels = sorted(set(cluster_labels_core))
+        for i, label in enumerate(unique_labels):
+            mask = cluster_labels_core == label
+            points = cluster_points[mask]
+            color = colors[i % len(colors)]
+
+            fig.add_trace(go.Scatter3d(
+                x=points[:, 0],
+                y=points[:, 1],
+                z=points[:, 2],
+                mode='markers',
+                name=f'Cluster {label} (n={len(points)})',
+                marker=dict(
+                    size=4,
+                    color=color,
+                    opacity=0.7,
+                    line=dict(color='white', width=0.5)
+                ),
+                hovertemplate=f'<b>Cluster {label}</b><br>UMAP-1: %{{x:.2f}}<br>UMAP-2: %{{y:.2f}}<br>UMAP-3: %{{z:.2f}}<extra></extra>'
+            ))
+
+    # Formatting
+    if title is None:
+        if color_by_population and population_labels is not None:
+            title = f'3D Population Distribution: {len(set(population_labels[~noise_mask]))} populations, {n_clusters} clusters'
+        else:
+            title = f'3D K-means Clustering: {n_clusters} clusters, {n_noise} noise points'
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=16)),
+        scene=dict(
+            xaxis_title='UMAP-1',
+            yaxis_title='UMAP-2',
+            zaxis_title='UMAP-3',
+            xaxis=dict(gridcolor='lightgray'),
+            yaxis=dict(gridcolor='lightgray'),
+            zaxis=dict(gridcolor='lightgray'),
+        ),
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        ),
+        hovermode='closest',
+        width=1200,
+        height=900
+    )
+
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    fig.write_html(output_path)
+
+    if verbose:
+        print(f'Saved interactive 3D visualization to: {output_path}')
 
 
 def create_cluster_visualization(
@@ -612,7 +760,7 @@ def create_cluster_visualization(
         if color_by_population and population_labels is not None:
             title = f'Population Distribution: {len(set(population_labels[~noise_mask]))} populations, {n_clusters} clusters'
         else:
-            title = f'HDBSCAN Clustering: {n_clusters} clusters, {n_noise} noise points'
+            title = f'K-means Clustering: {n_clusters} clusters, {n_noise} noise points'
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_xlabel('UMAP-1', fontsize=12)
     ax.set_ylabel('UMAP-2', fontsize=12)
@@ -647,7 +795,8 @@ def save_results(
     file_indices: np.ndarray,
     args: argparse.Namespace,
     verbose: bool = True,
-    population_labels: np.ndarray | None = None
+    population_labels: np.ndarray | None = None,
+    embedding_3d: np.ndarray | None = None
 ) -> None:
     """Save analysis results to .npz and optional JSON files."""
     import json
@@ -664,6 +813,8 @@ def save_results(
     }
     if population_labels is not None:
         save_data['population_labels'] = population_labels
+    if embedding_3d is not None:
+        save_data['embedding_3d'] = embedding_3d
 
     np.savez_compressed(npz_path, **save_data)
     if verbose:
@@ -684,12 +835,12 @@ def save_results(
         },
         'parameters': {
             'layer': layer_name,
+            'clustering_method': 'kmeans',
+            'n_clusters': args.n_clusters,
             'umap_intermediate_dim': args.umap_intermediate_dim,
             'umap_n_neighbors': args.umap_n_neighbors,
             'umap_min_dist': args.umap_min_dist,
-            'min_cluster_size': args.min_cluster_size,
-            'min_samples': args.min_samples or args.min_cluster_size,
-            'cluster_selection_method': args.cluster_selection_method,
+            'umap_3d': args.umap_3d,
             'random_state': args.random_state,
         }
     }
@@ -789,24 +940,23 @@ def main() -> None:
         step_num = 1
 
     # UMAP reduction
-    X_intermediate, X_2d = perform_umap_reduction(
+    X_intermediate, X_2d, X_3d = perform_umap_reduction(
         X_preprocessed,
         intermediate_dim=args.umap_intermediate_dim,
         n_neighbors=args.umap_n_neighbors,
         min_dist=args.umap_min_dist,
         random_state=args.random_state,
         verbose=True,
-        step_number=step_num
+        step_number=step_num,
+        use_3d=args.umap_3d
     )
 
-    # HDBSCAN clustering
+    # K-means Clustering
     step_num += 1
-    labels, clusterer = perform_hdbscan_clustering(
+    labels, clusterer = perform_kmeans_clustering(
         X_intermediate,
-        min_cluster_size=args.min_cluster_size,
-        min_samples=args.min_samples,
-        cluster_selection_epsilon=args.cluster_selection_epsilon,
-        cluster_selection_method=args.cluster_selection_method,
+        n_clusters=args.n_clusters,
+        random_state=args.random_state,
         verbose=True
     )
 
@@ -833,6 +983,23 @@ def main() -> None:
         color_by_population=args.color_by_population
     )
 
+    # Create 3D visualization if requested
+    if args.umap_3d and X_3d is not None:
+        output_3d = os.path.splitext(args.output)[0] + '_3d.html'
+        create_3d_visualization(
+            X_3d,
+            labels,
+            noise_mask,
+            output_path=output_3d,
+            title=args.title,
+            noise_color=args.noise_color,
+            noise_alpha=args.noise_alpha,
+            dpi=args.dpi,
+            verbose=True,
+            population_labels=population_labels,
+            color_by_population=args.color_by_population
+        )
+
     # Save results
     save_results(
         args.output,
@@ -845,7 +1012,8 @@ def main() -> None:
         file_indices=file_indices,
         args=args,
         verbose=True,
-        population_labels=population_labels
+        population_labels=population_labels,
+        embedding_3d=X_3d
     )
 
     # Final summary
@@ -853,10 +1021,12 @@ def main() -> None:
     print('Analysis Complete!')
     print(f'{"="*60}')
     print(f'\nResults:')
-    print(f'  Visualization: {args.output}')
+    print(f'  2D Visualization: {args.output}')
+    if args.umap_3d:
+        print(f'  3D Interactive Visualization: {os.path.splitext(args.output)[0]}_3d.html')
     print(f'  Embeddings: {os.path.splitext(args.output)[0]}_results.npz')
     print(f'  Metrics: {args.output_metrics or os.path.splitext(args.output)[0] + "_metrics.json"}')
-    print(f'\nClustering Summary:')
+    print(f'\nClustering Summary (K-MEANS):')
     print(f'  Clusters: {len(set(labels)) - (1 if -1 in labels else 0)}')
     print(f'  Noise: {np.sum(labels == -1)} ({noise_pct:.2f}%)')
     if metrics['silhouette_score'] is not None:
