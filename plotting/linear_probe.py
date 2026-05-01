@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """Linear probe for superpopulation classification from DeepVariant activations.
 
-Trains logistic regression on intermediate representations (e.g. mixed5) to
-quantify how much superpopulation information is linearly decodable. Uses
-leave-one-out cross-validation at the sample level to avoid data leakage.
+Trains a probe (linear logistic regression or small MLP) on intermediate
+representations (mixed1, mixed5, …) using leave-one-group-out CV at sample
+resolution to avoid leakage.
 
 Usage:
-  python plotting/linear_probe.py \
-    --cache_dir /path/to/activation_cache \
-    --population_metadata data/1kg_file_mapping.csv \
-    --layer mixed5 \
-    --output linear_probe_results.png \
-    --aggregate_per_sample \
-    --n_permutations 100
+  python plotting/linear_probe.py \\
+    --cache_dir CACHE_DIR \\
+    --population_metadata data/1kg_file_mapping.csv \\
+    --layer mixed5 --probe_kind linear
+
+  Multiple layers:
+
+  python plotting/linear_probe.py ... --layers mixed1,mixed3,mixed5,mixed7,mixed10 \\
+    --probe_kind linear
+
+  Training loss PNG (mean LOGO MLP folds only) when probing with ``--probe_kind mlp``.
+
+  python plotting/linear_probe.py ... --probe_kind mlp --plot_loss_curve
+
+Requires activation_cache/ with multiple activations_*.npz shards (one shard per
+sample, matching ``file_index`` in the CSV) so leave-one-group-out CV has at
+least two samples to split.
 """
 from __future__ import annotations
 
@@ -21,7 +31,7 @@ import glob
 import json
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -42,13 +52,26 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         help=(
             'Path to CSV with population labels. Must contain file_index '
-            'and super_population columns (e.g. data/1kg_file_mapping.csv).'
+            'and super_population columns (e.g. data/1kg_file_mapping.csv '
+            'or 1kg_file_mapping_v3.csv).'
         ),
     )
     p.add_argument(
         '--layer',
         default=None,
-        help='Layer name key in the npz files. Default: first key found.',
+        help=(
+            'Layer key in npz (e.g. mixed5). Default: first key in file. '
+            'Ignored if --layers is set.'
+        ),
+    )
+    p.add_argument(
+        '--layers',
+        default=None,
+        help=(
+            'Comma-separated layer keys to run sequentially (writes one '
+            '_<layer>_ suffix per output stem). Requires activations.npz '
+            'to contain these keys.'
+        ),
     )
     p.add_argument(
         '--output',
@@ -119,8 +142,177 @@ def _parse_args() -> argparse.Namespace:
         default=150,
         help='Figure DPI.',
     )
+    p.add_argument(
+        '--probe_kind',
+        choices=['linear', 'mlp'],
+        default='linear',
+        help='Probe: multinomial logistic (linear) or small MLP (nonlinear).',
+    )
+    p.add_argument(
+        '--epochs',
+        type=int,
+        default=80,
+        help='MLP: max_iter per LOGO fold (tol inflated so training runs epochs).',
+    )
+    p.add_argument(
+        '--mlp_hidden',
+        type=str,
+        default='128',
+        help='MLP hidden sizes, comma-separated (e.g. 128 or 256,128).',
+    )
+    p.add_argument(
+        '--plot_loss_curve',
+        action='store_true',
+        help=(
+            'MLP only: save mean LOGO-fold training loss vs iteration (`*_train_loss.png`). '
+            '(Ignored when --probe_kind linear.)'
+        ),
+    )
 
     return p.parse_args()
+
+
+def _parse_mlp_hidden(s: str) -> Tuple[int, ...]:
+    parts = [p.strip() for p in s.split(',') if p.strip()]
+    if not parts:
+        return (64,)
+    return tuple(int(x) for x in parts)
+
+
+def resolve_layer_list(args: argparse.Namespace) -> List[Optional[str]]:
+    if getattr(args, 'layers', None):
+        xs = [x.strip() for x in args.layers.split(',') if x.strip()]
+        return xs
+    return [args.layer]
+
+
+def resolve_output_paths(
+    output: str,
+    layer_name: str,
+    *,
+    suffix: Optional[str] = None,
+) -> Tuple[str, str]:
+    stem, ext = os.path.splitext(output)
+    if ext == '':
+        ext = '.png'
+        stem = output
+    tag = suffix or layer_name.replace('/', '_')
+    out_png = f'{stem}_{tag}{ext}'
+    out_metrics = f'{stem}_{tag}_metrics.json'
+    return out_png, out_metrics
+
+
+def plot_training_loss_curve(
+    train_curve: np.ndarray,
+    iter_axis: np.ndarray,
+    output_path: str,
+    title: str,
+    dpi: int = 150,
+) -> None:
+    """Save mean ± std cross-entropy / sklearn loss vs iteration."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    mean_tr = train_curve.mean(axis=0)
+    std_tr = train_curve.std(axis=0)
+    x = iter_axis[: mean_tr.shape[0]]
+    ax.plot(x, mean_tr, label='train (mean across folds)', color='#4C72B0')
+    ax.fill_between(
+        x, mean_tr - std_tr, mean_tr + std_tr, alpha=0.25, color='#4C72B0')
+    ax.set_xlabel('Iteration / epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, linestyle='--')
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved probe training loss curve: {output_path}')
+
+
+def _make_mlp_classifier(
+    epochs: int,
+    mlp_hidden: Tuple[int, ...],
+    random_state: int,
+):
+    """Adam MLP for LOGO probing / loss curves.
+
+    Do not pass enormous ``tol`` (e.g. 1e100): sklearn computes ``best_loss_ - tol``,
+    which overflows / raises cast warnings during training bookkeeping.
+    We keep default-like ``tol`` and set ``n_iter_no_change=max_iter`` so training
+    usually runs up to ``max_iter`` epochs unless loss diverges.
+    """
+    from sklearn.neural_network import MLPClassifier
+
+    n_ep = max(int(epochs), 1)
+    return MLPClassifier(
+        hidden_layer_sizes=mlp_hidden,
+        activation='relu',
+        solver='adam',
+        max_iter=n_ep,
+        early_stopping=False,
+        tol=1e-4,
+        n_iter_no_change=n_ep,
+        random_state=int(random_state % (2 ** 31)),
+        learning_rate_init=1e-3,
+        batch_size='auto',
+        verbose=False,
+    )
+
+
+def collect_logo_training_curves_mlp(
+    X: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray,
+    epochs: int,
+    pca_components: int,
+    mlp_hidden: Tuple[int, ...],
+    class_weight_balanced: bool,
+    random_state: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """One MLPClassifier fit per LOGO fold; stack loss_curve_ (padded)."""
+    from sklearn.model_selection import LeaveOneGroupOut
+    from sklearn.preprocessing import LabelEncoder, StandardScaler
+    from sklearn.utils.class_weight import compute_sample_weight
+
+    le = LabelEncoder()
+    y = le.fit_transform(labels)
+
+    logo = LeaveOneGroupOut()
+    curves: List[np.ndarray] = []
+    rs = random_state
+
+    for train_idx, test_idx in logo.split(X, y, groups):
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X[train_idx])
+        X_test = scaler.transform(X[test_idx])
+        X_train, X_test = _reduce_dimensions(
+            X_train, X_test, max_components=pca_components
+        )
+        yt = y[train_idx]
+        sw = compute_sample_weight('balanced', yt) if class_weight_balanced else None
+        clf = _make_mlp_classifier(epochs, mlp_hidden, rs)
+        rs += 7919
+
+        clf.fit(X_train, yt, sample_weight=sw)
+
+        lc = np.asarray(clf.loss_curve_, dtype=np.float64)
+        curves.append(lc)
+
+    maxlen = max(len(c) for c in curves)
+    stacked = []
+    for c in curves:
+        if len(c) < maxlen:
+            pad = np.full(maxlen - len(c), c[-1])
+            stacked.append(np.concatenate([c, pad]))
+        else:
+            stacked.append(c)
+    mat = np.vstack(stacked)
+    itr = np.arange(1, maxlen + 1, dtype=float)
+    return mat, itr
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +351,9 @@ def load_activations_with_shape(
             resolved_layer = keys[0]
         if resolved_layer not in data:
             raise KeyError(
-                f'Layer {resolved_layer!r} not in {path}; available: {keys}'
+                f'Layer {resolved_layer!r} not in {path}; available: {keys}. '
+                f'Likely stale shard (different --hook_layers). '
+                f'Run with consistent hooks or probe only layers every file has.'
             )
 
         arr = np.asarray(data[resolved_layer], dtype=np.float32)
@@ -185,6 +379,70 @@ def load_activations_with_shape(
     assert resolved_layer is not None
     assert raw_shape is not None
     return X, resolved_layer, file_indices, paths, raw_shape
+
+
+def validate_layer_keys_uniform_cache(
+    cache_dir: str, layer_names: List[str],
+) -> None:
+    """Fail fast if mixed hooked runs left inconsistent keys across shards."""
+    pattern = os.path.join(cache_dir, 'activations_*.npz')
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(f'No files matching {pattern}')
+
+    offenders: List[Tuple[str, List[str], List[str]]] = []
+    for path in paths:
+        with np.load(path) as z:
+            keys_set = set(z.keys())
+        missing = sorted([ln for ln in layer_names if ln not in keys_set])
+        if missing:
+            offenders.append((path, missing, sorted(keys_set)))
+
+    if not offenders:
+        return
+
+    print(
+        'ERROR: Activation shards disagree on hooked layers '
+        '(re-run inference with consistent --hook_layers, or wipe stale shards).',
+        file=sys.stderr,
+    )
+    print(
+        '\n'
+        '  Each activations_XXXXXXXX.npz must contain every layer you probe. '
+        'Older runs often only cached mixed5; newer defaults use '
+        'mixed1,mixed3,mixed5,mixed7,mixed10.',
+        file=sys.stderr,
+    )
+    print('\nShards missing requested keys:', file=sys.stderr)
+    for path, missing, avail in offenders:
+        try:
+            rel = os.path.relpath(path)
+        except ValueError:
+            rel = path
+        print(f'  {rel}', file=sys.stderr)
+        print(f'    missing: {missing!r}; available: {avail!r}', file=sys.stderr)
+    print(
+        '\nRemediation (recommended): '
+        'remove combined cache + rerun hooked pipeline:',
+        file=sys.stderr,
+    )
+    print(
+        '  rm 1kg_hooked_output/activation_cache/activations_*.npz',
+        file=sys.stderr,
+    )
+    print(
+        '  rm -rf 1kg_hooked_output/samples/*/activation_cache  # stale per-sample shards',
+        file=sys.stderr,
+    )
+    print(
+        '  bash scripts/run_1kg_hooked_defaults.sh\n',
+        file=sys.stderr,
+    )
+    print(
+        'Or probe only layers every shard still has (e.g. --layer mixed5).',
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 def load_population_metadata(
@@ -369,6 +627,106 @@ def run_linear_probe(
     }
 
 
+def run_mlp_probe(
+    X: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray,
+    random_state: int,
+    pca_components: int = 50,
+    epochs: int = 80,
+    mlp_hidden: Tuple[int, ...] = (128,),
+    class_weight_balanced: bool = False,
+) -> Dict:
+    """Leave-one-group-out probe with sklearn MLPClassifier."""
+    from sklearn.model_selection import LeaveOneGroupOut
+    from sklearn.preprocessing import LabelEncoder, StandardScaler
+    from sklearn.metrics import (
+        balanced_accuracy_score,
+        classification_report,
+        confusion_matrix,
+    )
+    from sklearn.utils.class_weight import compute_sample_weight
+
+    le = LabelEncoder()
+    y = le.fit_transform(labels)
+    class_names = list(le.classes_)
+
+    logo = LeaveOneGroupOut()
+    y_true_all: list[int] = []
+    y_pred_all: list[int] = []
+    rs_fold = random_state
+
+    for train_idx, test_idx in logo.split(X, y, groups):
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X[train_idx])
+        X_test = scaler.transform(X[test_idx])
+        X_train, X_test = _reduce_dimensions(
+            X_train, X_test, max_components=pca_components
+        )
+        yt = y[train_idx]
+        sw = compute_sample_weight('balanced', yt) if class_weight_balanced else None
+        clf = _make_mlp_classifier(epochs, mlp_hidden, rs_fold)
+        rs_fold += 7937
+        clf.fit(X_train, yt, sample_weight=sw)
+        preds = clf.predict(X_test)
+        y_true_all.extend(y[test_idx].tolist())
+        y_pred_all.extend(preds.tolist())
+
+    y_true_all_a = np.array(y_true_all)
+    y_pred_all_a = np.array(y_pred_all)
+    bal_acc = balanced_accuracy_score(y_true_all_a, y_pred_all_a)
+    report = classification_report(
+        y_true_all_a, y_pred_all_a,
+        target_names=class_names, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_true_all_a, y_pred_all_a)
+    return {
+        'balanced_accuracy': float(bal_acc),
+        'classification_report': report,
+        'confusion_matrix': cm.tolist(),
+        'class_names': class_names,
+        'y_true': y_true_all_a.tolist(),
+        'y_pred': y_pred_all_a.tolist(),
+        'n_samples': len(X),
+        'n_groups': len(np.unique(groups)),
+        'n_features': X.shape[1],
+    }
+
+
+def run_probe(
+    X: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray,
+    random_state: int,
+    *,
+    probe_kind: str,
+    pca_components: int,
+    logreg_c: float,
+    class_weight_balanced: bool,
+    epochs: int,
+    mlp_hidden: Tuple[int, ...],
+) -> Dict:
+    if probe_kind == 'linear':
+        return run_linear_probe(
+            X,
+            labels,
+            groups,
+            random_state,
+            pca_components=pca_components,
+            logreg_c=logreg_c,
+            class_weight_balanced=class_weight_balanced,
+        )
+    return run_mlp_probe(
+        X,
+        labels,
+        groups,
+        random_state,
+        pca_components=pca_components,
+        epochs=epochs,
+        mlp_hidden=mlp_hidden,
+        class_weight_balanced=class_weight_balanced,
+    )
+
+
 def compute_majority_baseline(labels: np.ndarray) -> float:
     """Balanced accuracy of always predicting the most common class."""
     from sklearn.metrics import balanced_accuracy_score
@@ -394,31 +752,23 @@ def _shuffle_labels_by_group(
     return permuted
 
 
-def run_permutation_baseline(
+def run_permutation_generic(
     X: np.ndarray,
     labels: np.ndarray,
     groups: np.ndarray,
     n_permutations: int,
     random_state: int,
-    pca_components: int = 50,
-    logreg_c: float = 1.0,
-    class_weight_balanced: bool = False,
+    probe_fn: Callable[
+        [np.ndarray, np.ndarray, np.ndarray, int], Dict
+    ],
 ) -> Dict:
-    """Shuffle labels and re-run the probe to build a null distribution."""
+    """Group-label permutations; probe_fn must return dict with balanced_accuracy."""
     rng = np.random.default_rng(random_state)
     null_scores: list[float] = []
 
     for i in range(n_permutations):
         shuffled = _shuffle_labels_by_group(labels, groups, rng)
-        result = run_linear_probe(
-            X,
-            shuffled,
-            groups,
-            random_state=i,
-            pca_components=pca_components,
-            logreg_c=logreg_c,
-            class_weight_balanced=class_weight_balanced,
-        )
+        result = probe_fn(X, shuffled, groups, i)
         null_scores.append(result['balanced_accuracy'])
         if (i + 1) % max(1, n_permutations // 5) == 0:
             print(f'  Permutation {i+1}/{n_permutations}: '
@@ -431,6 +781,42 @@ def run_permutation_baseline(
         'null_p95': float(np.percentile(null_scores, 95)),
         'null_p99': float(np.percentile(null_scores, 99)),
     }
+
+
+def run_permutation_baseline(
+    X: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray,
+    n_permutations: int,
+    random_state: int,
+    pca_components: int = 50,
+    logreg_c: float = 1.0,
+    class_weight_balanced: bool = False,
+    probe_kind: str = 'linear',
+    epochs: int = 80,
+    mlp_hidden: Tuple[int, ...] = (128,),
+) -> Dict:
+    """Shuffle labels and re-run the probe to build a null distribution."""
+
+    def _probe(
+        x: np.ndarray, lab: np.ndarray, grp: np.ndarray, rs: int
+    ) -> Dict:
+        return run_probe(
+            x,
+            lab,
+            grp,
+            rs,
+            probe_kind=probe_kind,
+            pca_components=pca_components,
+            logreg_c=logreg_c,
+            class_weight_balanced=class_weight_balanced,
+            epochs=epochs,
+            mlp_hidden=mlp_hidden,
+        )
+
+    return run_permutation_generic(
+        X, labels, groups, n_permutations, random_state, _probe
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +832,7 @@ def plot_results(
     centered_mode: bool,
     sample_means_mode: bool = False,
     dpi: int = 150,
+    probe_kind_label: str = 'linear',
 ) -> None:
     """Confusion matrix + accuracy comparison bar chart."""
     import matplotlib
@@ -497,7 +884,7 @@ def plot_results(
     else:
         mode_str = 'per-variant'
     ax.set_title(
-        f'Linear Probe ({mode_str})\n'
+        f'{probe_kind_label.capitalize()} probe ({mode_str})\n'
         f'{layer_name} | Balanced Acc: {bal_acc:.2%}',
         fontsize=11, fontweight='bold',
     )
@@ -585,6 +972,10 @@ def save_metrics(
             'layer': layer_name,
             'subtract_sample_mean': centered_mode,
             'use_sample_means': sample_means_mode,
+            'probe_kind': getattr(args, 'probe_kind', 'linear'),
+            'epochs': getattr(args, 'epochs', 80),
+            'mlp_hidden': getattr(args, 'mlp_hidden', '128'),
+            'plot_loss_curve': getattr(args, 'plot_loss_curve', False),
             'random_state': args.random_state,
             'n_permutations': args.n_permutations,
             'pca_components': args.pca_components,
@@ -619,165 +1010,253 @@ def save_metrics(
 
 def main() -> None:
     args = _parse_args()
+    if args.plot_loss_curve and args.probe_kind != 'mlp':
+        print(
+            'NOTE: --plot_loss_curve applies only when --probe_kind=mlp '
+            '(ignored for linear / logistic regression).',
+            file=sys.stderr,
+        )
+    if args.layers and args.output_metrics:
+        print(
+            'NOTE: --output_metrics is ignored with --layers '
+            '(metrics path is derived per layer).',
+            file=sys.stderr,
+        )
+
+    layer_keys = resolve_layer_list(args)
+    probe_layer_names = [
+        x.strip() for x in layer_keys
+        if x is not None and str(x).strip()
+    ]
+    if probe_layer_names:
+        validate_layer_keys_uniform_cache(args.cache_dir, probe_layer_names)
 
     print('=' * 60)
-    print('DeepVariant Linear Probe: Superpopulation Classification')
+    print('DeepVariant representation probe')
     print('=' * 60)
 
-    # -- Load activations --
-    print(f'\nLoading activations from: {args.cache_dir}')
-    X, layer_name, file_indices, file_paths, raw_shape = (
-        load_activations_with_shape(args.cache_dir, args.layer)
-    )
-    print(f'  Loaded {X.shape[0]} variants, {X.shape[1]} features '
-          f'(global avg pooled from {raw_shape})')
-    print(f'  Layer: {layer_name}')
-    print(f'  Source files: {len(file_paths)}')
-
-    # -- Load labels --
-    print(f'\nLoading population metadata from: {args.population_metadata}')
     pop_df = load_population_metadata(args.population_metadata)
-    labels, groups = assign_labels(file_indices, pop_df)
+    mlp_tuple = _parse_mlp_hidden(args.mlp_hidden)
 
-    known_mask = labels != 'UNKNOWN'
-    n_known = known_mask.sum()
-    print(f'  Matched {n_known}/{len(labels)} variants to population labels')
+    for lk in layer_keys:
+        lyr = lk.strip() if lk else None
 
-    if n_known == 0:
-        print('ERROR: No variants matched to population labels.', file=sys.stderr)
-        raise SystemExit(1)
+        print(f'\nLoading activations from: {args.cache_dir}')
+        X, resolved_layer, file_indices, file_paths, raw_shape = (
+            load_activations_with_shape(args.cache_dir, lyr)
+        )
+        print(f'  Loaded {X.shape[0]} variants, {X.shape[1]} features '
+              f'(global avg pooled from {raw_shape})')
+        print(f'  Layer key: {resolved_layer}')
+        print(f'  Source files: {len(file_paths)}')
 
-    X = X[known_mask]
-    labels = labels[known_mask]
-    groups = groups[known_mask]
+        print(f'\nJoining labels from: {args.population_metadata}')
+        labels, groups = assign_labels(file_indices, pop_df)
 
-    unique_pops, pop_counts = np.unique(labels, return_counts=True)
-    print('  Population distribution:')
-    for pop, count in zip(unique_pops, pop_counts):
-        print(f'    {pop}: {count} variants')
+        known_mask = labels != 'UNKNOWN'
+        if known_mask.sum() == 0:
+            print(
+                'ERROR: No variants matched to population labels.',
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
-    # -- Optional subsampling --
-    if args.max_samples is not None and args.max_samples < X.shape[0]:
-        rng = np.random.default_rng(args.random_state)
-        idx = rng.choice(X.shape[0], size=args.max_samples, replace=False)
-        X, labels, groups = X[idx], labels[idx], groups[idx]
-        print(f'  Subsampled to {X.shape[0]} variants.')
+        X = X[known_mask]
+        labels = labels[known_mask]
+        groups = groups[known_mask]
 
-    # -- Optional preprocessing modes --
-    if args.subtract_sample_mean and args.use_sample_means:
-        print('ERROR: --subtract_sample_mean and --use_sample_means are '
-              'mutually exclusive.', file=sys.stderr)
-        raise SystemExit(1)
+        unique_pops, pop_counts = np.unique(labels, return_counts=True)
+        print('  Population distribution:')
+        for pop, count in zip(unique_pops, pop_counts):
+            print(f'    {pop}: {count} variants')
 
-    centered_mode = args.subtract_sample_mean
-    sample_means_mode = args.use_sample_means
+        if args.max_samples is not None and args.max_samples < X.shape[0]:
+            rng = np.random.default_rng(args.random_state)
+            idx = rng.choice(X.shape[0], size=args.max_samples, replace=False)
+            X, labels, groups = X[idx], labels[idx], groups[idx]
+            print(f'  Subsampled to {X.shape[0]} variants.')
 
-    if centered_mode:
-        print(f'\nSubtracting per-sample mean from variant activations...')
-        X = subtract_sample_means(X, groups)
-        print(f'  Centered {X.shape[0]} variants across '
-              f'{len(np.unique(groups[groups >= 0]))} samples')
-    elif sample_means_mode:
-        print(f'\nAggregating to per-sample mean vectors...')
-        X, labels, groups = aggregate_to_sample_means(X, labels, groups)
-        print(f'  Collapsed to {X.shape[0]} sample-mean vectors')
+        if args.subtract_sample_mean and args.use_sample_means:
+            print(
+                'ERROR: --subtract_sample_mean and --use_sample_means are '
+                'mutually exclusive.',
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
-    n_groups = len(np.unique(groups))
-    if n_groups < 2:
-        print('ERROR: Need at least 2 samples for cross-validation.',
-              file=sys.stderr)
-        raise SystemExit(1)
+        centered_mode = args.subtract_sample_mean
+        sample_means_mode = args.use_sample_means
 
-    # -- Run probe --
-    print(f'\n{"="*60}')
-    print(f'Running LOOCV linear probe ({n_groups} folds, 1 per sample)...')
-    print(f'{"="*60}')
-    probe_result = run_linear_probe(
-        X,
-        labels,
-        groups,
-        args.random_state,
-        pca_components=args.pca_components,
-        logreg_c=args.logreg_c,
-        class_weight_balanced=args.class_weight_balanced,
-    )
-    print(f'  Balanced accuracy: {probe_result["balanced_accuracy"]:.4f}')
+        if centered_mode:
+            print('\nSubtracting per-sample mean from variant activations...')
+            X = subtract_sample_means(X, groups)
+            print(f'  Centered {X.shape[0]} variants across '
+                  f'{len(np.unique(groups[groups >= 0]))} samples')
+        elif sample_means_mode:
+            print('\nAggregating to per-sample mean vectors...')
+            X, labels, groups = aggregate_to_sample_means(X, labels, groups)
+            print(f'  Collapsed to {X.shape[0]} sample-mean vectors')
 
-    # -- Baselines --
-    print(f'\n{"="*60}')
-    print('Computing baselines...')
-    print(f'{"="*60}')
+        n_groups = len(np.unique(groups))
+        print(f'  Distinct samples (LOGO groups): {n_groups} '
+              f'(from {len(file_paths)} activation .npz shard(s))')
+        if n_groups < 2:
+            print(
+                'ERROR: Need at least 2 sequenced samples for leave-one-group-out '
+                f'cross-validation (found {n_groups} group(s)).',
+                file=sys.stderr,
+            )
+            print(
+                '  Each row inherits a shard index from the sorted list '
+                '`activations_00000000.npz`, `activations_00000001.npz`, … → '
+                'file_index 0, 1, … which must match the mapping CSV.',
+                file=sys.stderr,
+            )
+            print(
+                '\n'
+                '  Only one shard (e.g. `tmp_hooked_run/activation_cache/` from a '
+                'single-sample run) assigns every variant to one sample.\n'
+                '  Fix: use a combined cache such as '
+                '`1kg_hooked_output/activation_cache/` produced by '
+                '`bash scripts/run_1kg_hooked.sh …`, '
+                'or any directory containing multiple activation .npz files '
+                'in the same index order as your CSV.',
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
-    majority_bl = compute_majority_baseline(labels)
-    print(f'  Majority class baseline: {majority_bl:.4f}')
+        if args.layers is not None:
+            out_png, metrics_auto = resolve_output_paths(
+                args.output, resolved_layer)
+        else:
+            out_png = args.output
+            metrics_auto = (
+                args.output_metrics
+                or os.path.splitext(args.output)[0] + '_metrics.json'
+            )
 
-    permutation_result = None
-    if args.n_permutations > 0:
-        print(f'\n  Running {args.n_permutations} permutations...')
-        permutation_result = run_permutation_baseline(
+        loop_args = argparse.Namespace(**vars(args))
+        loop_args.output_metrics = metrics_auto
+        # Training loss PNG exists only for MLP; keep metrics JSON honest.
+        if loop_args.probe_kind != 'mlp':
+            loop_args.plot_loss_curve = False
+
+        print(f'\n{"=" * 60}')
+        print(f'Probe: {args.probe_kind} ({n_groups} LOGO folds)')
+        print('=' * 60)
+        probe_result = run_probe(
             X,
             labels,
             groups,
-            args.n_permutations,
             args.random_state,
+            probe_kind=args.probe_kind,
             pca_components=args.pca_components,
             logreg_c=args.logreg_c,
             class_weight_balanced=args.class_weight_balanced,
+            epochs=args.epochs,
+            mlp_hidden=mlp_tuple,
         )
-        null_scores = np.array(permutation_result['null_scores'])
-        p_value = (
-            (np.sum(null_scores >= probe_result['balanced_accuracy']) + 1)
-            / (len(null_scores) + 1)
+        print(f'  Balanced accuracy: {probe_result["balanced_accuracy"]:.4f}')
+
+        print(f'\n{"=" * 60}')
+        print('Computing baselines...')
+        print('=' * 60)
+        majority_bl = compute_majority_baseline(labels)
+
+        permutation_result = None
+        p_value = 0.0
+        if args.n_permutations > 0:
+            print(f'\n  Running {args.n_permutations} group-label permutations...')
+            permutation_result = run_permutation_baseline(
+                X,
+                labels,
+                groups,
+                args.n_permutations,
+                args.random_state,
+                pca_components=args.pca_components,
+                logreg_c=args.logreg_c,
+                class_weight_balanced=args.class_weight_balanced,
+                probe_kind=args.probe_kind,
+                epochs=args.epochs,
+                mlp_hidden=mlp_tuple,
+            )
+            ns = np.array(permutation_result['null_scores'])
+            p_value = float(
+                (np.sum(ns >= probe_result['balanced_accuracy']) + 1)
+                / (len(ns) + 1)
+            )
+            print(
+                f'  Permutation null: {permutation_result["null_mean"]:.4f} '
+                f'+/- {permutation_result["null_std"]:.4f}'
+            )
+            print(f'  p-value: {p_value:.4f}')
+
+        if args.plot_loss_curve and args.probe_kind == 'mlp':
+            loss_stem = os.path.splitext(out_png)[0] + '_train_loss.png'
+            mats, itr = collect_logo_training_curves_mlp(
+                X,
+                labels,
+                groups,
+                args.epochs,
+                args.pca_components,
+                mlp_tuple,
+                args.class_weight_balanced,
+                args.random_state,
+            )
+            plot_training_loss_curve(
+                mats,
+                itr,
+                loss_stem,
+                title=(
+                    f'MLP probe training loss '
+                    f'({resolved_layer}, mean LOGO folds)'
+                ),
+                dpi=args.dpi,
+            )
+
+        print('\nGenerating confusion matrix...')
+        plot_results(
+            probe_result,
+            majority_bl,
+            permutation_result,
+            output_path=out_png,
+            layer_name=resolved_layer,
+            centered_mode=centered_mode,
+            sample_means_mode=sample_means_mode,
+            dpi=args.dpi,
+            probe_kind_label=args.probe_kind,
         )
-        print(f'  Permutation null: {permutation_result["null_mean"]:.4f} '
-              f'+/- {permutation_result["null_std"]:.4f}')
-        print(f'  p-value: {p_value:.4f}')
 
-    # -- Visualize --
-    print(f'\n{"="*60}')
-    print('Generating plots...')
-    print(f'{"="*60}')
-    plot_results(
-        probe_result,
-        majority_bl,
-        permutation_result,
-        output_path=args.output,
-        layer_name=layer_name,
-        centered_mode=centered_mode,
-        sample_means_mode=sample_means_mode,
-        dpi=args.dpi,
-    )
+        save_metrics(
+            out_png,
+            probe_result,
+            majority_bl,
+            permutation_result,
+            layer_name=resolved_layer,
+            centered_mode=centered_mode,
+            sample_means_mode=sample_means_mode,
+            args=loop_args,
+        )
 
-    # -- Save metrics --
-    save_metrics(
-        args.output,
-        probe_result,
-        majority_bl,
-        permutation_result,
-        layer_name=layer_name,
-        centered_mode=centered_mode,
-        sample_means_mode=sample_means_mode,
-        args=args,
-    )
+        if centered_mode:
+            mode_label = 'sample-mean-subtracted'
+        elif sample_means_mode:
+            mode_label = 'sample-means-only'
+        else:
+            mode_label = 'raw per-variant'
 
-    # -- Summary --
-    if centered_mode:
-        mode_label = 'sample-mean-subtracted'
-    elif sample_means_mode:
-        mode_label = 'sample-means-only'
-    else:
-        mode_label = 'raw per-variant'
-    print(f'\n{"="*60}')
-    print('Linear Probe Complete!')
-    print(f'{"="*60}')
-    print(f'  Layer: {layer_name}')
-    print(f'  Mode: {mode_label}')
-    print(f'  Balanced Accuracy: {probe_result["balanced_accuracy"]:.4f}')
-    print(f'  Majority Baseline: {majority_bl:.4f}')
-    if permutation_result:
-        print(f'  Permutation Mean:  {permutation_result["null_mean"]:.4f}')
-        print(f'  p-value:           {p_value:.4f}')
-    print()
+        print(f'\n{"=" * 60}')
+        print('Probe complete')
+        print('=' * 60)
+        print(f'  Layer: {resolved_layer}')
+        print(f'  Kind: {args.probe_kind}')
+        print(f'  Mode: {mode_label}')
+        print(f'  Balanced Accuracy: {probe_result["balanced_accuracy"]:.4f}')
+        print(f'  Majority Baseline: {majority_bl:.4f}')
+        if permutation_result:
+            print(f'  Permutation Mean: {permutation_result["null_mean"]:.4f}')
+            print(f'  p-value: {p_value:.4f}')
+        print()
 
 
 if __name__ == '__main__':
