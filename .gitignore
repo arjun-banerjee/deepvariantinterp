@@ -10,3 +10,22 @@
 bazel-*
 
 **/.ipynb_checkpoints
+
+# Data files
+*.bam
+*.bam.bai
+*.zip
+*.npz
+data/
+model/
+quickstart-output/
+quickstart-testdata/
+
+# OS files
+.DS_Store
+
+# Clustering outputs
+clustering_output*
+
+# Proto generated files
+**/*_pb2.py

@@ -23,6 +23,7 @@ set -e  # Exit on error
 ################################################################################
 
 # Configuration
+LAYER="mixed5"                         # DeepVariant layer to extract (mixed0-mixed10)
 REGION_GCS="20:10000000-10100000"      # Region for GCS download (no "chr" prefix)
 REGION_UCSC="chr20:10000000-10100000"  # Region for DeepVariant (with "chr" prefix)
 GCS_BUCKET="gs://brain-genomics-public/research/cohort/1KGP/grch37_bams/"
@@ -32,7 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$(dirname "${SCRIPT_DIR}")"  # Project root
 BAM_DIR="${WORK_DIR}/data/1kg_bams"
 OUTPUT_BASE="${WORK_DIR}/data/1kg_embeddings"
-COMBINED_CACHE="${WORK_DIR}/data/1kg_combined_cache_all"
+COMBINED_CACHE="${WORK_DIR}/data/1kg_combined_cache_${LAYER}"
 RESULTS_DIR="${WORK_DIR}/data/results"
 REF_DIR="${WORK_DIR}/data/reference"
 REF="${REF_DIR}/chr20_ucsc.fasta"
@@ -309,7 +310,7 @@ for SAMPLE in "${SAMPLES[@]}"; do
       --checkpoint "model/wgs" \
       --outfile "${OUTFILE}" \
       --activation_cache_dir "${ACTIVATION_DIR}" \
-      --hook_layers "mixed5" \
+      --hook_layers "${LAYER}" \
       --batch_size 512 \
       --max_cache_entries 10000 || {
         echo "  ERROR: call_variants_hooked failed for ${SAMPLE}, skipping"
@@ -411,12 +412,12 @@ echo "Running cluster_activations.py on ${#PROCESSED_SAMPLES[@]} samples..."
 python3 plotting/cluster_activations.py \
   --cache_dir "${COMBINED_CACHE}" \
   --output "${OUTPUT_PNG}" \
-  --layer mixed5 \
+  --layer "${LAYER}" \
   --population_metadata "${METADATA_CSV}" \
   --color_by_population \
   --use_pca \
   --pca_components 200 \
-  --umap_intermediate_dim 20 \
+  --umap_intermediate_dim 50 \
   --umap_n_neighbors 100 \
   --n_clusters 5 \
   --random_state 42

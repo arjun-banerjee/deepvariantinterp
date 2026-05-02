@@ -918,79 +918,207 @@ def main() -> None:
             population_labels = population_labels[idx]
         print(f'Subsampled to {X.shape[0]} samples.')
 
-    if X.shape[0] < args.min_cluster_size:
-        print(
-            f'ERROR: Need at least {args.min_cluster_size} samples '
-            f'(have {X.shape[0]}). Reduce --min_cluster_size.',
-            file=sys.stderr
-        )
+    # Standardize the data once
+    try:
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        print('ERROR: scikit-learn not installed. Run: pip install scikit-learn',
+              file=sys.stderr)
         raise SystemExit(1)
 
-    # Optional PCA preprocessing
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    print(f'\nStandardized features: {X_scaled.shape}')
+
+    # Run PCA and UMAP separately (not chained)
+    X_pca = None
+    X_umap_intermediate = None
+    X_2d = None
+    X_3d = None
+
     if args.use_pca:
-        X_preprocessed = perform_pca_reduction(
+        # PCA dimensionality reduction
+        X_pca = perform_pca_reduction(
             X,
             n_components=args.pca_components,
             random_state=args.random_state,
             verbose=True
         )
-        step_num = 2
-    else:
-        X_preprocessed = X
-        step_num = 1
 
-    # UMAP reduction
-    X_intermediate, X_2d, X_3d = perform_umap_reduction(
-        X_preprocessed,
+    # UMAP reduction (runs on X_scaled, NOT on PCA output)
+    X_umap_intermediate, X_2d, X_3d = perform_umap_reduction(
+        X_scaled,
         intermediate_dim=args.umap_intermediate_dim,
         n_neighbors=args.umap_n_neighbors,
         min_dist=args.umap_min_dist,
         random_state=args.random_state,
         verbose=True,
-        step_number=step_num,
+        step_number=2 if args.use_pca else 1,
         use_3d=args.umap_3d
     )
 
-    # K-means Clustering
-    step_num += 1
-    labels, clusterer = perform_kmeans_clustering(
-        X_intermediate,
-        n_clusters=args.n_clusters,
-        random_state=args.random_state,
-        verbose=True
-    )
+    # K-means Clustering - run on both PCA and UMAP if PCA is enabled
+    if args.use_pca and X_pca is not None:
+        # Cluster on PCA
+        print(f'\nClustering on PCA embeddings ({X_pca.shape[1]}D)...')
+        labels_pca, clusterer_pca = perform_kmeans_clustering(
+            X_pca,
+            n_clusters=args.n_clusters,
+            random_state=args.random_state,
+            verbose=True
+        )
+        noise_mask_pca, core_mask_pca, noise_pct_pca = analyze_noise(labels_pca, verbose=True)
+        metrics_pca = calculate_clustering_metrics(
+            X_pca, labels_pca, core_mask_pca, verbose=True
+        )
 
-    # Step 3: Noise analysis
-    noise_mask, core_mask, noise_pct = analyze_noise(labels, verbose=True)
+        # Cluster on UMAP
+        print(f'\nClustering on UMAP embeddings ({X_umap_intermediate.shape[1]}D)...')
+        labels_umap, clusterer_umap = perform_kmeans_clustering(
+            X_umap_intermediate,
+            n_clusters=args.n_clusters,
+            random_state=args.random_state,
+            verbose=True
+        )
+        noise_mask_umap, core_mask_umap, noise_pct_umap = analyze_noise(labels_umap, verbose=True)
+        metrics_umap = calculate_clustering_metrics(
+            X_umap_intermediate, labels_umap, core_mask_umap, verbose=True
+        )
 
-    # Step 4: Metrics
-    metrics = calculate_clustering_metrics(
-        X_intermediate, labels, core_mask, verbose=True
-    )
+        # Use PCA clustering as primary for visualization
+        clustering_input = X_pca
+        labels = labels_pca
+        noise_mask = noise_mask_pca
+        core_mask = core_mask_pca
+        metrics = metrics_pca
+        clustering_method = f'PCA-{args.pca_components}D'
+    else:
+        # Only UMAP clustering
+        print(f'\nClustering on UMAP embeddings ({X_umap_intermediate.shape[1]}D)...')
+        clustering_input = X_umap_intermediate
+        clustering_method = f'UMAP-{args.umap_intermediate_dim}D'
 
-    # Step 5: Visualization
-    create_cluster_visualization(
-        X_2d,
-        labels,
-        noise_mask,
-        output_path=args.output,
-        title=args.title,
-        noise_color=args.noise_color,
-        noise_alpha=args.noise_alpha,
-        dpi=args.dpi,
-        verbose=True,
-        population_labels=population_labels,
-        color_by_population=args.color_by_population
-    )
+        labels, clusterer = perform_kmeans_clustering(
+            clustering_input,
+            n_clusters=args.n_clusters,
+            random_state=args.random_state,
+            verbose=True
+        )
+        noise_mask, core_mask, noise_pct = analyze_noise(labels, verbose=True)
+        metrics = calculate_clustering_metrics(
+            clustering_input, labels, core_mask, verbose=True
+        )
 
-    # Create 3D visualization if requested
-    if args.umap_3d and X_3d is not None:
-        output_3d = os.path.splitext(args.output)[0] + '_3d.html'
-        create_3d_visualization(
-            X_3d,
+    # Step 5: Visualization and saving results
+    if args.use_pca and X_pca is not None:
+        # We have both PCA and UMAP clustering - save both separately
+
+        # PCA clustering visualization and results
+        output_pca = os.path.splitext(args.output)[0] + '_pca.png'
+        create_cluster_visualization(
+            X_2d,
+            labels_pca,
+            noise_mask_pca,
+            output_path=output_pca,
+            title=f'{args.title} (PCA clustering)' if args.title else 'PCA Clustering',
+            noise_color=args.noise_color,
+            noise_alpha=args.noise_alpha,
+            dpi=args.dpi,
+            verbose=True,
+            population_labels=population_labels,
+            color_by_population=args.color_by_population
+        )
+
+        save_results(
+            output_pca,
+            embedding_2d=X_2d,
+            embedding_intermediate=X_pca,
+            labels=labels_pca,
+            metrics=metrics_pca,
+            layer_name=layer_name,
+            file_paths=file_paths,
+            file_indices=file_indices,
+            args=args,
+            verbose=True,
+            population_labels=population_labels,
+            embedding_3d=X_3d
+        )
+
+        # UMAP clustering visualization and results
+        output_umap = os.path.splitext(args.output)[0] + '_umap.png'
+        create_cluster_visualization(
+            X_2d,
+            labels_umap,
+            noise_mask_umap,
+            output_path=output_umap,
+            title=f'{args.title} (UMAP clustering)' if args.title else 'UMAP Clustering',
+            noise_color=args.noise_color,
+            noise_alpha=args.noise_alpha,
+            dpi=args.dpi,
+            verbose=True,
+            population_labels=population_labels,
+            color_by_population=args.color_by_population
+        )
+
+        save_results(
+            output_umap,
+            embedding_2d=X_2d,
+            embedding_intermediate=X_umap_intermediate,
+            labels=labels_umap,
+            metrics=metrics_umap,
+            layer_name=layer_name,
+            file_paths=file_paths,
+            file_indices=file_indices,
+            args=args,
+            verbose=True,
+            population_labels=population_labels,
+            embedding_3d=X_3d
+        )
+
+        # 3D visualizations if requested
+        if args.umap_3d and X_3d is not None:
+            output_3d_pca = os.path.splitext(args.output)[0] + '_pca_3d.html'
+            create_3d_visualization(
+                X_3d,
+                labels_pca,
+                noise_mask_pca,
+                output_path=output_3d_pca,
+                title=f'{args.title} (PCA clustering)' if args.title else 'PCA Clustering',
+                noise_color=args.noise_color,
+                noise_alpha=args.noise_alpha,
+                dpi=args.dpi,
+                verbose=True,
+                population_labels=population_labels,
+                color_by_population=args.color_by_population
+            )
+
+            output_3d_umap = os.path.splitext(args.output)[0] + '_umap_3d.html'
+            create_3d_visualization(
+                X_3d,
+                labels_umap,
+                noise_mask_umap,
+                output_path=output_3d_umap,
+                title=f'{args.title} (UMAP clustering)' if args.title else 'UMAP Clustering',
+                noise_color=args.noise_color,
+                noise_alpha=args.noise_alpha,
+                dpi=args.dpi,
+                verbose=True,
+                population_labels=population_labels,
+                color_by_population=args.color_by_population
+            )
+
+        # Set primary variables for final summary (use PCA as primary)
+        labels = labels_pca
+        noise_mask = noise_mask_pca
+        metrics = metrics_pca
+
+    else:
+        # Only UMAP clustering - single output
+        create_cluster_visualization(
+            X_2d,
             labels,
             noise_mask,
-            output_path=output_3d,
+            output_path=args.output,
             title=args.title,
             noise_color=args.noise_color,
             noise_alpha=args.noise_alpha,
@@ -1000,41 +1128,94 @@ def main() -> None:
             color_by_population=args.color_by_population
         )
 
-    # Save results
-    save_results(
-        args.output,
-        embedding_2d=X_2d,
-        embedding_intermediate=X_intermediate,
-        labels=labels,
-        metrics=metrics,
-        layer_name=layer_name,
-        file_paths=file_paths,
-        file_indices=file_indices,
-        args=args,
-        verbose=True,
-        population_labels=population_labels,
-        embedding_3d=X_3d
-    )
+        # Create 3D visualization if requested
+        if args.umap_3d and X_3d is not None:
+            output_3d = os.path.splitext(args.output)[0] + '_3d.html'
+            create_3d_visualization(
+                X_3d,
+                labels,
+                noise_mask,
+                output_path=output_3d,
+                title=args.title,
+                noise_color=args.noise_color,
+                noise_alpha=args.noise_alpha,
+                dpi=args.dpi,
+                verbose=True,
+                population_labels=population_labels,
+                color_by_population=args.color_by_population
+            )
+
+        # Save results
+        save_results(
+            args.output,
+            embedding_2d=X_2d,
+            embedding_intermediate=clustering_input,
+            labels=labels,
+            metrics=metrics,
+            layer_name=layer_name,
+            file_paths=file_paths,
+            file_indices=file_indices,
+            args=args,
+            verbose=True,
+            population_labels=population_labels,
+            embedding_3d=X_3d
+        )
 
     # Final summary
     print(f'\n{"="*60}')
     print('Analysis Complete!')
     print(f'{"="*60}')
-    print(f'\nResults:')
-    print(f'  2D Visualization: {args.output}')
-    if args.umap_3d:
-        print(f'  3D Interactive Visualization: {os.path.splitext(args.output)[0]}_3d.html')
-    print(f'  Embeddings: {os.path.splitext(args.output)[0]}_results.npz')
-    print(f'  Metrics: {args.output_metrics or os.path.splitext(args.output)[0] + "_metrics.json"}')
-    print(f'\nClustering Summary (K-MEANS):')
-    print(f'  Clusters: {len(set(labels)) - (1 if -1 in labels else 0)}')
-    print(f'  Noise: {np.sum(labels == -1)} ({noise_pct:.2f}%)')
-    if metrics['silhouette_score'] is not None:
-        print(f'  Silhouette Score: {metrics["silhouette_score"]:.4f}')
-    if metrics['davies_bouldin_index'] is not None:
-        print(f'  Davies-Bouldin Index: {metrics["davies_bouldin_index"]:.4f}')
-    if metrics['dbcv_score'] is not None:
-        print(f'  DBCV Score: {metrics["dbcv_score"]:.4f}')
+
+    if args.use_pca and X_pca is not None:
+        # Both PCA and UMAP clustering were run
+        print(f'\nResults (PCA Clustering):')
+        print(f'  2D Visualization: {os.path.splitext(args.output)[0]}_pca.png')
+        print(f'  Embeddings: {os.path.splitext(args.output)[0]}_pca_results.npz')
+        print(f'  Metrics: {os.path.splitext(args.output)[0]}_pca_metrics.json')
+        if args.umap_3d:
+            print(f'  3D Interactive: {os.path.splitext(args.output)[0]}_pca_3d.html')
+
+        print(f'\nResults (UMAP Clustering):')
+        print(f'  2D Visualization: {os.path.splitext(args.output)[0]}_umap.png')
+        print(f'  Embeddings: {os.path.splitext(args.output)[0]}_umap_results.npz')
+        print(f'  Metrics: {os.path.splitext(args.output)[0]}_umap_metrics.json')
+        if args.umap_3d:
+            print(f'  3D Interactive: {os.path.splitext(args.output)[0]}_umap_3d.html')
+
+        print(f'\nClustering Summary (PCA K-means):')
+        print(f'  Clusters: {len(set(labels_pca)) - (1 if -1 in labels_pca else 0)}')
+        print(f'  Noise: {np.sum(labels_pca == -1)} ({noise_pct_pca:.2f}%)')
+        if metrics_pca['silhouette_score'] is not None:
+            print(f'  Silhouette Score: {metrics_pca["silhouette_score"]:.4f}')
+        if metrics_pca['davies_bouldin_index'] is not None:
+            print(f'  Davies-Bouldin Index: {metrics_pca["davies_bouldin_index"]:.4f}')
+
+        print(f'\nClustering Summary (UMAP K-means):')
+        print(f'  Clusters: {len(set(labels_umap)) - (1 if -1 in labels_umap else 0)}')
+        print(f'  Noise: {np.sum(labels_umap == -1)} ({noise_pct_umap:.2f}%)')
+        if metrics_umap['silhouette_score'] is not None:
+            print(f'  Silhouette Score: {metrics_umap["silhouette_score"]:.4f}')
+        if metrics_umap['davies_bouldin_index'] is not None:
+            print(f'  Davies-Bouldin Index: {metrics_umap["davies_bouldin_index"]:.4f}')
+    else:
+        # Only UMAP clustering
+        print(f'\nResults:')
+        print(f'  2D Visualization: {args.output}')
+        if args.umap_3d:
+            print(f'  3D Interactive Visualization: {os.path.splitext(args.output)[0]}_3d.html')
+        print(f'  Embeddings: {os.path.splitext(args.output)[0]}_results.npz')
+        print(f'  Metrics: {args.output_metrics or os.path.splitext(args.output)[0] + "_metrics.json"}')
+        print(f'\nClustering Summary (K-MEANS):')
+        print(f'  Clusters: {len(set(labels)) - (1 if -1 in labels else 0)}')
+        noise_pct = 100.0 * np.sum(labels == -1) / len(labels)
+        print(f'  Noise: {np.sum(labels == -1)} ({noise_pct:.2f}%)')
+        if metrics['silhouette_score'] is not None:
+            print(f'  Silhouette Score: {metrics["silhouette_score"]:.4f}')
+        if metrics['davies_bouldin_index'] is not None:
+            print(f'  Davies-Bouldin Index: {metrics["davies_bouldin_index"]:.4f}')
+        if metrics['dbcv_score'] is not None:
+            print(f'  DBCV Score: {metrics["dbcv_score"]:.4f}')
+
     print()
 
 
